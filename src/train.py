@@ -11,9 +11,35 @@ import keras
 import pickle as pkl
 
 
+def _has_conf_key(conf, key):
+    if conf is None:
+        return False
+    if isinstance(conf, dict):
+        return key in conf
+    if hasattr(conf, "__contains__"):
+        try:
+            return key in conf
+        except TypeError:
+            pass
+    return hasattr(conf, key)
+
+
+def _get_conf_value(conf, key, default=None):
+    if conf is None:
+        return default
+    if hasattr(conf, "get"):
+        return conf.get(key, default)
+    return getattr(conf, key, default)
+
+
 def train_hgq(model: keras.Model, X, Y, Xs, Ys, conf):
     save_path = Path(conf.save_path)
     save_path.mkdir(parents=True, exist_ok=True)
+
+    init_weights = _get_conf_value(conf.train, "init_weights", None)
+    if init_weights:
+        print(f"Loading initial weights from {init_weights}")
+        model.load_weights(init_weights)
 
     pred = model.predict(Xs, batch_size=2048, verbose=0)  # type: ignore
     hgq_acc_1 = np.mean(np.argmax(pred, axis=1) == np.array(Ys).ravel())
@@ -24,8 +50,27 @@ def train_hgq(model: keras.Model, X, Y, Xs, Ys, conf):
 
     print("Compiling model & registering callbacks...")
     opt = keras.optimizers.Adam()
-    loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    metrics = ["accuracy"]
+    trust_conf = _get_conf_value(conf, "trust", None)
+    trust_enabled = (
+        _has_conf_key(conf, "trust")
+        and trust_conf is not None
+        and bool(_get_conf_value(trust_conf, "enabled", True))
+    )
+    ece_bins = int(_get_conf_value(trust_conf, "ece_bins", 15))
+    ece_weight = float(_get_conf_value(trust_conf, "ece_weight", 1.0))
+    if trust_enabled:
+        from hgq.losses import SparseCategoricalCrossentropyWithSoftECE
+        from hgq.metrics import SparseCategoricalECE
+
+        loss = SparseCategoricalCrossentropyWithSoftECE(
+            from_logits=True,
+            n_bins=ece_bins,
+            ece_weight=ece_weight,
+        )
+        metrics = ["accuracy", SparseCategoricalECE(from_logits=True, n_bins=ece_bins)]
+    else:
+        loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+        metrics = ["accuracy"]
     model.compile(optimizer=opt, loss=loss, metrics=metrics)  # type: ignore
 
     assert conf.train.cdr_args["t_mul"] == 1
@@ -55,18 +100,41 @@ def train_hgq(model: keras.Model, X, Y, Xs, Ys, conf):
 
     scheduler = keras.callbacks.LearningRateScheduler(cosine_decay_restarts)
 
-    pbar = PBar(
-        metric="loss: {loss:.2f}/{val_loss:.2f} - acc: {accuracy:.2%}/{val_accuracy:.2%} - lr:{learning_rate:.2e} - beta: {beta:.2e}"
-    )
+    if trust_enabled:
+        pbar = PBar(
+            metric="loss: {loss:.2f}/{val_loss:.2f} - acc: {accuracy:.2%}/{val_accuracy:.2%} - ece: {ece:.4f}/{val_ece:.4f} - lr:{learning_rate:.2e} - beta: {beta:.2e}"
+        )
+    else:
+        pbar = PBar(
+            metric="loss: {loss:.2f}/{val_loss:.2f} - acc: {accuracy:.2%}/{val_accuracy:.2%} - lr:{learning_rate:.2e} - beta: {beta:.2e}"
+        )
 
     terminate_on_nan = keras.callbacks.TerminateOnNaN()
 
+    if trust_enabled:
+        pareto_metrics = ["val_accuracy", "ebops", "val_ece"]
+        pareto_sides = [1, -1, -1]
+        fname_format = (
+            "epoch={epoch}-acc={accuracy:.2%}-val_acc={val_accuracy:.2%}"
+            "-val_ece={val_ece:.5f}-EBOPs={ebops}.keras"
+        )
+    else:
+        pareto_metrics = ["val_accuracy", "ebops"]
+        pareto_sides = [1, -1]
+        fname_format = "epoch={epoch}-acc={accuracy:.2%}-val_acc={val_accuracy:.2%}-EBOPs={ebops}.keras"
+    if trust_enabled:
+        pareto_min_accuracy = float(
+            _get_conf_value(trust_conf, "pareto_min_accuracy", 0.5)
+        )
+    else:
+        pareto_min_accuracy = 0.5
+
     save = ParetoFront(
         path=save_path / "ckpts",
-        fname_format="epoch={epoch}-acc={accuracy:.2%}-val_acc={val_accuracy:.2%}-EBOPs={ebops}.keras",
-        metrics=["val_accuracy", "ebops"],
-        enable_if=lambda x: x["val_accuracy"] > 0.5,
-        sides=[1, -1],
+        fname_format=fname_format,
+        metrics=pareto_metrics,
+        enable_if=lambda x: x["val_accuracy"] > pareto_min_accuracy,
+        sides=pareto_sides,
     )
 
     ebops = FreeEBOPs()
